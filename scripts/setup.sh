@@ -17,8 +17,8 @@ fi
 .venv/bin/python -m pip install --upgrade pip wheel
 .venv/bin/pip install -r requirements.txt
 
-# rembg 依赖 opencv-python-headless，会与桌面 GUI 版 cv2 冲突（缺少 imshow）。
-# 运行库已写入 requirements.txt，这里只装 rembg 本体，不装它声明的 OpenCV。
+# rembg 依赖 opencv-python-headless，会与项目使用的 opencv-python 冲突
+# （两个 cv2 发行版互相覆盖）。运行库已写入 requirements.txt，这里只装 rembg 本体。
 .venv/bin/pip install --no-deps rembg==2.0.69
 
 mkdir -p models/rembg
@@ -61,16 +61,21 @@ print("U2Net model ready")
 PY
 
 .venv/bin/python - <<'PY'
+import tkinter
 import cv2
 import numpy
 import onnxruntime
 import PIL
 import rembg
+import tkinterdnd2
+from tkinterdnd2 import TkinterDnD
 
-assert hasattr(cv2, "imshow"), "OpenCV GUI build missing (imshow not found)"
 assert hasattr(cv2, "FaceDetectorYN"), "YuNet API missing in OpenCV build"
+assert hasattr(TkinterDnD, "Tk"), "tkinterdnd2 is not usable"
 print(f"opencv={cv2.__version__} numpy={numpy.__version__} "
-      f"onnxruntime={onnxruntime.__version__} pillow={PIL.__version__} rembg={rembg.__version__ if hasattr(rembg, '__version__') else 'ok'}")
+      f"onnxruntime={onnxruntime.__version__} pillow={PIL.__version__} "
+      f"rembg={rembg.__version__ if hasattr(rembg, '__version__') else 'ok'} "
+      f"tkinter={tkinter.TkVersion} tkinterdnd2=ok")
 PY
 
 echo "Setup complete."

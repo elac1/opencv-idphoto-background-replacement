@@ -4,12 +4,16 @@ import argparse
 import math
 import sys
 import time
+import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from tkinter import filedialog
 
 import cv2
 import numpy as np
+from PIL import Image, ImageTk
+from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from .compose import CropBox, compute_crop_box, render_crop
 from .config import (
@@ -30,6 +34,8 @@ SOURCE_BOX = (20, 70, 900, 760)
 PANEL_BOX = (920, 70, 1260, 760)
 PREVIEW_MAX = (280, 390)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+CAMERA_FPS = 15
 
 COLOR_BG = (22, 22, 26)
 COLOR_HEADER = (30, 30, 36)
@@ -85,42 +91,177 @@ class IDPhotoApp:
         self.running = True
         self._dirty = True
 
+        self.root: TkinterDnD.Tk | None = None
+        self.canvas: tk.Canvas | None = None
+        self._photo: ImageTk.PhotoImage | None = None
+        self._image_item: int | None = None
+        self._drop_hover = False
+        self._busy = False
+
     def run(self, initial_image: Path | None = None, auto_camera: bool = True) -> int:
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
-        cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
+        try:
+            self.root = TkinterDnD.Tk()
+        except tk.TclError as exc:
+            print(f"无法打开桌面窗口: {exc}", file=sys.stderr)
+            return 1
+        self.root.title(WINDOW_NAME)
+        self.root.resizable(False, False)
+        self.canvas = tk.Canvas(
+            self.root,
+            width=CANVAS_WIDTH,
+            height=CANVAS_HEIGHT,
+            highlightthickness=0,
+            bd=0,
+            bg="#1a1616",
+        )
+        self.canvas.pack()
+        self.root.geometry(f"{CANVAS_WIDTH}x{CANVAS_HEIGHT}+40+40")
+        self._image_item = self.canvas.create_image(0, 0, anchor="nw")
+        self._bind_events()
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
+
+        self._set_status("Drop a photo to start")
+        self._show_canvas(self._build_still_frame())
+        self.root.update_idletasks()
+        self.root.lift()
+        try:
+            self.root.focus_force()
+            self.canvas.focus_force()
+        except tk.TclError:
+            pass
+
         try:
             if initial_image is not None:
                 self.load_path(initial_image)
             elif auto_camera:
                 self.start_camera()
-            else:
-                self._set_status("No photo loaded - press O to open an image")
-
-            self.running = True
-            while self.running:
-                if self.camera_active:
-                    frame = self._read_camera_frame()
-                    now = time.monotonic()
-                    if frame is not None and now - self._last_camera_draw >= 1 / 15:
-                        cv2.imshow(WINDOW_NAME, self._build_camera_frame(frame))
-                        self._last_camera_draw = now
-                        self._dirty = False
-                elif self._dirty:
-                    cv2.imshow(WINDOW_NAME, self._build_still_frame())
-                    self._dirty = False
-
-                key = cv2.waitKey(30) & 0xFF
-                if key != 255:
-                    self._handle_key(key)
-                try:
-                    if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                        break
-                except cv2.error:
-                    break
+            if not self.running:
+                return 0
+            self._tick()
+            if self.running:
+                self.root.mainloop()
         finally:
             self._release_camera()
-            cv2.destroyAllWindows()
+            if self.root is not None:
+                try:
+                    self.root.destroy()
+                except tk.TclError:
+                    pass
+                self.root = None
+                self.canvas = None
         return 0
+
+    def _bind_events(self) -> None:
+        assert self.canvas is not None
+        self.canvas.bind(
+            "<ButtonPress-1>",
+            lambda event: self._on_tk_mouse(cv2.EVENT_LBUTTONDOWN, event),
+        )
+        self.canvas.bind(
+            "<B1-Motion>",
+            lambda event: self._on_tk_mouse(cv2.EVENT_MOUSEMOVE, event),
+        )
+        self.canvas.bind(
+            "<ButtonRelease-1>",
+            lambda event: self._on_tk_mouse(cv2.EVENT_LBUTTONUP, event),
+        )
+        self.canvas.bind("<KeyPress>", self._on_key_event)
+        self.canvas.drop_target_register(DND_FILES)
+        self.canvas.dnd_bind("<<DropEnter>>", self._on_drop_enter)
+        self.canvas.dnd_bind("<<DropPosition>>", self._on_drop_position)
+        self.canvas.dnd_bind("<<DropLeave>>", self._on_drop_leave)
+        self.canvas.dnd_bind("<<Drop>>", self._on_drop)
+        self.canvas.focus_set()
+
+    def _tick(self) -> None:
+        if not self.running or self.root is None:
+            return
+        if self.camera_active:
+            frame = self._read_camera_frame()
+            now = time.monotonic()
+            if frame is not None and now - self._last_camera_draw >= 1 / CAMERA_FPS:
+                self._show_canvas(self._build_camera_frame(frame))
+                self._last_camera_draw = now
+                self._dirty = False
+        elif self._dirty:
+            self._show_canvas(self._build_still_frame())
+            self._dirty = False
+        self.root.after(30, self._tick)
+
+    def _show_canvas(self, bgr: np.ndarray) -> None:
+        if self.canvas is None or self._image_item is None:
+            return
+        image = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        if self._photo is None:
+            self._photo = ImageTk.PhotoImage(image)
+        else:
+            self._photo.paste(image)
+        self.canvas.itemconfigure(self._image_item, image=self._photo)
+
+    def _quit(self) -> None:
+        self.running = False
+        if self.root is not None:
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass
+
+    def _on_key_event(self, event: tk.Event) -> None:
+        if self._busy or event.state & (0x4 | 0x8):
+            return
+        keysym = event.keysym
+        if keysym == "Escape":
+            key = 27
+        elif keysym == "space":
+            key = 32
+        elif len(keysym) == 1 and keysym.isalnum():
+            key = ord(keysym.lower())
+        else:
+            return
+        self._handle_key(key)
+
+    def _on_tk_mouse(self, cv_event: int, event: tk.Event) -> None:
+        if self._busy:
+            return
+        if self.canvas is not None:
+            self.canvas.focus_set()
+        self._on_mouse(cv_event, event.x, event.y, 0, None)
+
+    def _on_drop_enter(self, event) -> str | None:
+        if not self._busy:
+            self._drop_hover = True
+            self._dirty = True
+        return getattr(event, "action", None)
+
+    def _on_drop_position(self, event) -> str | None:
+        return getattr(event, "action", None)
+
+    def _on_drop_leave(self, event) -> None:
+        if self._drop_hover:
+            self._drop_hover = False
+            self._dirty = True
+
+    def _on_drop(self, event) -> str | None:
+        self._drop_hover = False
+        self._dirty = True
+        if self._busy or self.root is None:
+            return None
+        try:
+            paths = self.root.tk.splitlist(event.data)
+        except tk.TclError:
+            paths = [event.data]
+        if not paths:
+            return None
+        path = Path(paths[0])
+        if path.suffix.lower() not in IMAGE_SUFFIXES:
+            self._set_status("Unsupported file - use JPG/PNG/WEBP", error=True)
+            return None
+        if self.camera_active:
+            self._release_camera()
+        if self.canvas is not None:
+            self.canvas.focus_set()
+        self.load_path(path)
+        return getattr(event, "action", None)
 
     def load_path(self, path: Path) -> None:
         try:
@@ -203,28 +344,38 @@ class IDPhotoApp:
         image: np.ndarray,
         label: str,
     ) -> None:
-        self._set_status("Detecting face...")
-        self._processing_frame("Detecting face...")
-        try:
-            face = self.processor.detect(image)
-            self._set_status("Removing background...")
-            self._processing_frame("Removing background...")
-            cutout = self.processor.cutout(image)
-        except Exception as exc:
-            self._fail(self._error_text(exc), exc)
+        if self._busy:
             return
+        self._busy = True
+        try:
+            self._set_status("Detecting face...")
+            self._processing_frame("Detecting face...")
+            try:
+                face = self.processor.detect(image)
+                self._set_status("Removing background...")
+                self._processing_frame("Removing background...")
+                cutout = self.processor.cutout(image)
+            except Exception as exc:
+                self._fail(self._error_text(exc), exc)
+                return
+            if not self.running:
+                return
 
-        self.image = image
-        self.source_label = label
-        self.face = face
-        self.cutout = cutout
-        self.crop_box = compute_crop_box(face, image.shape[1], image.shape[0], self.size)
-        self._display_cache = None
-        self._shaded_cache = None
-        self._display_rect = None
-        self._drag = None
-        self._invalidate_preview()
-        self._set_status("Ready - drag crop to adjust")
+            self.image = image
+            self.source_label = label
+            self.face = face
+            self.cutout = cutout
+            self.crop_box = compute_crop_box(
+                face, image.shape[1], image.shape[0], self.size
+            )
+            self._display_cache = None
+            self._shaded_cache = None
+            self._display_rect = None
+            self._drag = None
+            self._invalidate_preview()
+            self._set_status("Ready - drag crop or drop another photo")
+        finally:
+            self._busy = False
 
     def _error_text(self, exc: Exception) -> str:
         if isinstance(exc, FaceNotFoundError):
@@ -300,34 +451,24 @@ class IDPhotoApp:
         self._load_image(frame.copy(), "camera capture")
 
     def _open_dialog(self) -> None:
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-        except Exception as exc:
-            self._fail("File dialog unavailable", exc)
+        if self.root is None:
             return
-
-        root = None
         try:
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
             selected = filedialog.askopenfilename(
-                parent=root,
+                parent=self.root,
                 title="Open a portrait photo",
                 filetypes=[
                     ("Images", "*.jpg *.jpeg *.png *.bmp *.webp"),
                     ("All files", "*.*"),
                 ],
             )
-        except Exception as exc:
+        except tk.TclError as exc:
             self._fail("File dialog failed", exc)
             return
-        finally:
-            if root is not None:
-                root.destroy()
         if selected:
             self.load_path(Path(selected))
+        if self.canvas is not None:
+            self.canvas.focus_set()
 
     def _handle_key(self, key: int) -> None:
         if 65 <= key <= 90:
@@ -337,10 +478,10 @@ class IDPhotoApp:
                 self._release_camera()
                 self._set_status("Camera cancelled")
             else:
-                self.running = False
+                self._quit()
             return
         if key == ord("q"):
-            self.running = False
+            self._quit()
             return
         if self.camera_active:
             if key == 32:
@@ -507,12 +648,31 @@ class IDPhotoApp:
             self._draw_empty_source(canvas)
         else:
             self._draw_still_source(canvas)
+            if self._drop_hover:
+                self._draw_drop_overlay(canvas)
         return canvas
 
     def _build_camera_frame(self, frame: np.ndarray) -> np.ndarray:
         canvas = self._get_base_canvas().copy()
         self._draw_camera_source(canvas, frame)
+        if self._drop_hover:
+            self._draw_drop_overlay(canvas)
         return canvas
+
+    def _draw_drop_overlay(self, canvas: np.ndarray) -> None:
+        cv2.rectangle(
+            canvas, SOURCE_BOX[:2], SOURCE_BOX[2:], COLOR_ACCENT, 3, cv2.LINE_AA
+        )
+        self._put_centered(
+            canvas,
+            "Release to load photo",
+            (SOURCE_BOX[0] + SOURCE_BOX[2]) // 2,
+            SOURCE_BOX[3] - 26,
+            0.6,
+            COLOR_ACCENT,
+            2,
+            shadow=True,
+        )
 
     def _get_base_canvas(self) -> np.ndarray:
         if self._base_cache is None:
@@ -552,25 +712,73 @@ class IDPhotoApp:
             hint = "SPACE  Capture     ESC  Cancel     Q  Quit"
         else:
             hint = (
-                "Drag crop: move | corners: resize    O Open   C Camera   S Save   "
-                "A Auto   1 One-inch   2 Two-inch   W/B/R BG   Q Quit"
+                "Drop photo anywhere | Drag crop: move | corners: resize    "
+                "O Open   C Camera   S Save   A Auto   1/2 Size   W/B/R BG   Q Quit"
             )
         cv2.putText(canvas, hint, (20, 786), FONT, 0.46, COLOR_MUTED, 1, cv2.LINE_AA)
         self._draw_panel(canvas)
         return canvas
 
     def _draw_empty_source(self, canvas: np.ndarray) -> None:
+        x0 = SOURCE_BOX[0] + 70
+        y0 = SOURCE_BOX[1] + 70
+        x1 = SOURCE_BOX[2] - 70
+        y1 = SOURCE_BOX[3] - 70
+        color = COLOR_ACCENT if self._drop_hover else COLOR_BORDER
+        if self._drop_hover:
+            cv2.rectangle(canvas, (x0 + 1, y0 + 1), (x1 - 1, y1 - 1), (26, 34, 26), -1)
+        self._draw_dashed_rect(canvas, (x0, y0), (x1, y1), color, 2)
+
         center_x = (SOURCE_BOX[0] + SOURCE_BOX[2]) // 2
         center_y = (SOURCE_BOX[1] + SOURCE_BOX[3]) // 2
+        icon_width, icon_height = 84, 60
+        icon_x = center_x - icon_width // 2
+        icon_y = center_y - 132
+        cv2.rectangle(
+            canvas,
+            (icon_x, icon_y),
+            (icon_x + icon_width, icon_y + icon_height),
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.circle(
+            canvas, (icon_x + icon_width - 20, icon_y + 18), 7, color, 2, cv2.LINE_AA
+        )
+        cv2.line(
+            canvas,
+            (icon_x + 8, icon_y + icon_height - 12),
+            (icon_x + 32, icon_y + 34),
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.line(
+            canvas,
+            (icon_x + 32, icon_y + 34),
+            (icon_x + icon_width - 8, icon_y + icon_height - 12),
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        title = "Drop to load the photo" if self._drop_hover else "Drop a photo here"
         self._put_centered(
-            canvas, "No photo loaded", center_x, center_y - 12, 0.82, COLOR_TEXT, 2
+            canvas, title, center_x, center_y - 20, 0.82, color, 2
         )
         self._put_centered(
             canvas,
-            "Press O to open an image or C to use the camera",
+            "JPG / PNG / BMP / WEBP",
             center_x,
-            center_y + 32,
-            0.55,
+            center_y + 18,
+            0.5,
+            COLOR_MUTED,
+        )
+        self._put_centered(
+            canvas,
+            "or press O to open, C to use the camera",
+            center_x,
+            center_y + 54,
+            0.5,
             COLOR_MUTED,
         )
 
@@ -810,8 +1018,35 @@ class IDPhotoApp:
             cv2.LINE_AA,
         )
         self._put_centered(canvas, text, center_x, y0 + 44, 0.62, COLOR_TEXT)
-        cv2.imshow(WINDOW_NAME, canvas)
-        cv2.waitKey(1)
+        if self.root is None:
+            return
+        try:
+            self._show_canvas(canvas)
+            self.root.update_idletasks()
+        except tk.TclError:
+            self.running = False
+
+    @staticmethod
+    def _draw_dashed_rect(
+        canvas: np.ndarray,
+        top_left: tuple[int, int],
+        bottom_right: tuple[int, int],
+        color: tuple[int, int, int],
+        thickness: int = 2,
+        dash: int = 14,
+        gap: int = 10,
+    ) -> None:
+        x0, y0 = top_left
+        x1, y1 = bottom_right
+        step = dash + gap
+        for x in range(x0, x1, step):
+            end = min(x + dash, x1)
+            cv2.line(canvas, (x, y0), (end, y0), color, thickness, cv2.LINE_AA)
+            cv2.line(canvas, (x, y1), (end, y1), color, thickness, cv2.LINE_AA)
+        for y in range(y0, y1, step):
+            end = min(y + dash, y1)
+            cv2.line(canvas, (x0, y), (x0, end), color, thickness, cv2.LINE_AA)
+            cv2.line(canvas, (x1, y), (x1, end), color, thickness, cv2.LINE_AA)
 
     @staticmethod
     def _put_text(

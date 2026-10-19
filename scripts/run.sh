@@ -17,5 +17,10 @@ if [[ ! -f models/rembg/u2net.onnx ]]; then
   exit 1
 fi
 
+if ! .venv/bin/python -c "import tkinter, tkinterdnd2" 2>/dev/null; then
+  echo "缺少图形界面依赖（python3-tk 或 tkinterdnd2），请安装 python3-tk 后重新运行 ./scripts/setup.sh" >&2
+  exit 1
+fi
+
 # 会打开桌面窗口；未指定图片且未加 --no-camera 时会自动调用摄像头。
 exec .venv/bin/python -m idphoto.app "$@"
