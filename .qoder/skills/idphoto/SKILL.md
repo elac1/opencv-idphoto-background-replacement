@@ -1,6 +1,6 @@
 ---
 name: idphoto
-description: Operate and maintain the local ID-photo auto-crop and background-replacement app. Use when setting up the Python environment or models, running the OpenCV desktop editor or CLI, debugging YuNet face detection, crop framing, rembg U2Net cutout or alpha compositing, validating output sizes and DPI, running tests, or preparing Conventional Commits in this repo.
+description: Operate and maintain the local ID-photo auto-crop and background-replacement app. Use when setting up the Python environment or models, running the Tkinter/OpenCV desktop editor (including file drag-and-drop) or CLI, debugging YuNet face detection, crop framing, rembg U2Net cutout or alpha compositing, validating output sizes and DPI, running tests, or preparing Conventional Commits in this repo.
 ---
 
 # ID Photo Studio
@@ -17,7 +17,7 @@ Run from the repo root. `.venv/bin/python` is Python 3.10.
 ./scripts/setup.sh
 ```
 
-Side effects: creates `.venv/` if missing, installs pinned dependencies, downloads YuNet (~232 KB) and U²-Net (~176 MB) into `models/` (gitignored). No sudo. First run needs network; later runs are offline.
+Side effects: creates `.venv/` if missing, installs pinned dependencies (including `tkinterdnd2`), downloads YuNet (~232 KB) and U²-Net (~176 MB) into `models/` (gitignored). No sudo, but the system must provide Tk (`python3-tk` on Ubuntu). First run needs network; later runs are offline.
 
 ### Desktop editor
 
@@ -25,9 +25,9 @@ Side effects: creates `.venv/` if missing, installs pinned dependencies, downloa
 ./scripts/run.sh [IMAGE] [--camera N] [--no-camera]
 ```
 
-Side effects: opens a 1280×800 window and blocks until quit. Without `IMAGE` and without `--no-camera`, it opens camera 0 (camera indicator turns on). `S` writes to `outputs/` (gitignored); camera capture is mirrored.
+The editor is a Tkinter Canvas + `tkinterdnd2` shell; all frames are still rendered by OpenCV. Side effects: opens a 1280×800 window and blocks until quit. Without `IMAGE` and without `--no-camera`, it opens camera 0 (camera indicator turns on). `S` writes to `outputs/` (gitignored); camera capture is mirrored.
 
-Controls: `O` open, `C` camera, `SPACE` capture, `ESC` cancel capture, `S` save, `A` auto-frame, `1`/`2` one/two-inch, `W`/`B`/`R` white/blue/red, drag inside to move the crop, drag a corner to resize at the fixed output ratio, `Q`/`ESC` quit.
+Drop a JPG/PNG/BMP/WEBP file anywhere on the window to load it automatically; dropping while an image or camera is active replaces it. Controls: `O` open, `C` camera, `SPACE` capture, `ESC` cancel capture, `S` save, `A` auto-frame, `1`/`2` one/two-inch, `W`/`B`/`R` white/blue/red, drag inside to move the crop, drag a corner to resize at the fixed output ratio, `Q`/`ESC` quit.
 
 ### CLI
 
@@ -66,7 +66,7 @@ print("acceptance OK")
 PY
 ```
 
-YuNet should report a face score of about 0.9 on the demo. If no display is available, skip the GUI and validate via CLI.
+YuNet should report a face score of about 0.9 on the demo. If no display is available, skip the GUI and validate via CLI. GUI changes should also be smoke-tested for: initial image launch, immediate shortcuts before any click, real file drop, crop drag, camera open/cancel, save, and quit.
 
 ## Architecture map
 
@@ -79,7 +79,7 @@ YuNet should report a face score of about 0.9 on the demo. If no display is avai
 | `idphoto/segmenter.py` | Lazy rembg U²-Net session, RGBA cutout |
 | `idphoto/pipeline.py` | `PhotoResult`; detect → cutout → render orchestration |
 | `idphoto/cli.py` | Argument parsing and CLI output |
-| `idphoto/app.py` | OpenCV desktop editor, camera, drag, save |
+| `idphoto/app.py` | Tkinter Canvas shell, DnD, camera loop, crop mouse events, save |
 
 Data contracts: `read_image` returns BGR; the detector expects BGR; `cutout` returns RGBA; background colors are RGB; `render_crop` returns RGB `uint8`.
 
@@ -92,10 +92,15 @@ Fixed specs: one-inch 295×413, two-inch 413×579, both 300 DPI. Crop math: heig
 - U²-Net lives at `models/rembg/u2net.onnx`; set `U2NET_HOME` to that directory before importing rembg. `setup.sh` verifies SHA-256 `8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491`.
 - `segmenter.py` sets `NUMBA_THREADING_LAYER=workqueue` before importing rembg to avoid the TBB interface warning; keep it.
 - `render_crop` must keep `np.rint` before `uint8` and premultiplied alpha; truncation causes dark halos and breaks compositing tests.
-- Still mode redraws only when `_dirty` is set. Do not force continuous redraws; idle CPU was reduced from ~90% to ~1%. Camera preview still costs roughly 70% of one core because Qt5 uses software rendering here.
+- Never reintroduce `cv2.imshow` / `cv2.waitKey`; the Tk event loop owns input and display. Frames remain BGR arrays rendered by `_build_*_frame`, then shown through `_show_canvas` (RGB → PIL → `PhotoImage.paste`).
+- Keyboard events are bound to the Canvas. Call `canvas.focus_force()` after mapping, not only `root.focus_force()`, or shortcuts do nothing until the first mouse click.
+- Keep `canvas.drop_target_register(DND_FILES)` and the four `dnd_bind` handlers. A real OS drag is required to validate the payload: synthetic `event_generate("<<Drop>>")` yields `??` fields. For automation, run the app and a tkdnd drag source inside a nested Xephyr display and drive the pointer with XTEST.
+- `_busy` blocks reentrant keys and drops while YuNet/rembg run synchronously. `_processing_frame` flushes with `update_idletasks`, not `update`, so a scheduled `_tick` cannot overwrite the progress frame.
+- Dropping a file while the camera is live must release the camera first; keep that behavior.
+- Still mode redraws only when `_dirty` is set. Do not force continuous redraws; idle CPU is ~0.7%. Camera preview is heavier because every frame is resized, converted, and pasted into a Tk `PhotoImage`.
 - Auto detector falls back to Haar only when the YuNet file is missing; a missing U²-Net model is a hard `RuntimeError`.
 - Models run locally; no image leaves the machine during processing.
-- Known limits: one face per image, segmentation artifacts on busy backgrounds or fine hair, and output sizes are common standards rather than a legal guarantee.
+- Known limits: one face per image, segmentation artifacts on busy backgrounds or fine hair, output sizes are common standards rather than a legal guarantee, and drag-and-drop relies on X11/Xdnd (Wayland uses XWayland).
 
 ## Repo rules
 
