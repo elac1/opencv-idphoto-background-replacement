@@ -5,7 +5,7 @@ description: Operate and maintain the local ID-photo auto-crop and background-re
 
 # ID Photo Studio
 
-Local-only ID photo tool: YuNet detects the largest face, a 2×face-height crop is composed to a 5:7 frame, rembg U²-Net cuts out the portrait, and premultiplied-alpha compositing replaces the background.
+Local-only ID photo tool: YuNet detects the largest face, a 2×face-height crop is composed to a 5:7 frame, rembg (IS-Net) cuts out the portrait, and premultiplied-alpha compositing replaces the background.
 
 ## Commands
 
@@ -47,7 +47,7 @@ Writes `outputs/{stem}_{size}_{bg}.jpg` by default and prints face box, crop box
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-29 `unittest` tests (not pytest). The real-portrait integration test skips automatically when `assets/test/private/portrait_source.png` or either model is absent.
+58 `unittest` tests (not pytest). The real-portrait integration test skips automatically when `assets/test/private/portrait_source.png` or either model is absent.
 
 Acceptance check with the bundled demo:
 
@@ -76,12 +76,14 @@ YuNet should report a face score of about 0.9 on the demo. If no display is avai
 | `idphoto/io_utils.py` | EXIF-corrected read, alpha over white, RGB→BGR; JPEG/PNG write with DPI |
 | `idphoto/detector.py` | `Face`, YuNet via `cv2.FaceDetectorYN`, Haar fallback |
 | `idphoto/compose.py` | `CropBox`, `compute_crop_box`, premultiplied-alpha `render_crop` |
-| `idphoto/segmenter.py` | Lazy rembg U²-Net session, RGBA cutout |
+| `idphoto/segmenter.py` | Lazy rembg session, RGBA cutout, five-step postprocess (fill holes → guided-filter alpha → colour-line alpha → decontaminate → optional trim) |
 | `idphoto/pipeline.py` | `PhotoResult`; detect → cutout → render orchestration |
 | `idphoto/cli.py` | Argument parsing and CLI output |
 | `idphoto/app.py` | Tkinter Canvas shell, DnD, camera loop, crop mouse events, save |
 
 Data contracts: `read_image` returns BGR; the detector expects BGR; `cutout` returns RGBA; background colors are RGB; `render_crop` returns RGB `uint8`.
+
+`cutout` RGB is **deliberately not** the source pixels: `decontaminate` rewrites partial-alpha pixels with `F = (C − (1−a)·B0) / max(a, DECONTAMINATE_FLOOR)`, so the cutout carries de-fringed colours instead of the original background-tinted ones. Do not "restore" the original RGB anywhere downstream, or the old halo comes back. Fully opaque and fully transparent pixels keep their source colour, so only the transition band differs.
 
 Fixed specs: one-inch 295×413, two-inch 413×579, both 300 DPI. Crop math: height `2.0 × face.height`, width `height × target_aspect`, top `face.y − 0.45 × face.height`, horizontally centered on the face, then clamped and proportionally shrunk to the image bounds.
 
@@ -93,6 +95,12 @@ Fixed specs: one-inch 295×413, two-inch 413×579, both 300 DPI. Crop math: heig
 - rembg ≥2.0.7x moved its cache to a nested `<U2NET_HOME>/models/<name>/<name>.onnx` layout, while this project (pinned `rembg==2.0.69`) expects the flat `<U2NET_HOME>/<name>.onnx`. If rembg is ever upgraded, `PortraitSegmenter._load_session` will stop finding models — re-check the layout before bumping the pin.
 - YuNet must not be fed full-resolution large images: confidence collapses (measured 0.654 on a 1760×2464 photo, below the 0.85 threshold, plus one spurious face) and it rose to 0.924 once the long side was capped at `DETECT_MAX_SIDE` (1080). Keep the resize + coordinate scale-back in `_detect_yunet`.
 - `segmenter.py` sets `NUMBA_THREADING_LAYER=workqueue` before importing rembg to avoid the TBB interface warning; keep it.
+- Halos have **two independent causes**, and fixing one does not fix the other:
+  1. Foreground RGB still carries the old background colour `B0` → handled by `decontaminate`.
+  2. The model marks soft/out-of-focus flyaway hair as nearly opaque `a≈1`, where the pixel colour *is* the old background → no amount of decontamination helps, the alpha itself is wrong. Handled by `color_line_alpha`, which re-solves `a = (C−B)·(F−B)/‖F−B‖²` inside a `COLOR_LINE_RADIUS` band around the silhouette. Setting `COLOR_LINE_RADIUS = 0` disables it and the top-of-head glow returns.
+- `_extend_colour` must stay a single-sided **normalised convolution** (`GaussianBlur(source·weights) / GaussianBlur(weights)`), not `cv2.inpaint` and not nearest-known-pixel fill. Inpaint pulls colour across the band from the opposite side (foreground and background fields bleed into each other, alpha solves wrong and tests fail); nearest-neighbour fill produces bright blotches on smooth gradients.
+- `color_line_alpha` only runs when `estimate_background_field` returns a field (flat or smoothly varying background). On busy backgrounds F/B cannot be estimated, and the projection would wreck the edge — that is intentional, not a missing branch.
+- `postprocess` fill-holes step only sets **newly filled** interior holes to 1.0. Re-binarising the whole mask hardens the soft band and makes halos worse (measured 82.1 → 103.8 on the halo metric).
 - `render_crop` must keep `np.rint` before `uint8` and premultiplied alpha; truncation causes dark halos and breaks compositing tests.
 - Never reintroduce `cv2.imshow` / `cv2.waitKey`; the Tk event loop owns input and display. Frames remain BGR arrays rendered by `_build_*_frame`, then shown through `_show_canvas` (RGB → PIL → `PhotoImage.paste`).
 - Keyboard events are bound to the Canvas. Call `canvas.focus_force()` after mapping, not only `root.focus_force()`, or shortcuts do nothing until the first mouse click.
