@@ -89,7 +89,9 @@ Fixed specs: one-inch 295×413, two-inch 413×579, both 300 DPI. Crop math: heig
 
 - Install rembg with `--no-deps`. It declares `opencv-python-headless`, which replaces the GUI build and breaks `cv2.imshow`; never install the headless package into this venv.
 - YuNet must come from `media.githubusercontent.com/media/opencv/opencv_zoo/...`; the raw GitHub URL returns an LFS pointer. `setup.sh` rejects files under 200 KB.
-- U²-Net lives at `models/rembg/u2net.onnx`; set `U2NET_HOME` to that directory before importing rembg. `setup.sh` verifies SHA-256 `8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491`.
+- The segmentation model is chosen by `SEGMENT_MODEL` in `config.py` (default `isnet-general-use`) and must sit at `models/rembg/<SEGMENT_MODEL>.onnx`; set `U2NET_HOME` to that directory before importing rembg. `setup.sh` reads the name from `config.py` and verifies SHA-256 (`isnet-general-use`: `60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a`, matching rembg's official md5 `fc16ebd8b0c10d971d3513d564d01e29`; `u2net`: `8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491`).
+- rembg ≥2.0.7x moved its cache to a nested `<U2NET_HOME>/models/<name>/<name>.onnx` layout, while this project (pinned `rembg==2.0.69`) expects the flat `<U2NET_HOME>/<name>.onnx`. If rembg is ever upgraded, `PortraitSegmenter._load_session` will stop finding models — re-check the layout before bumping the pin.
+- YuNet must not be fed full-resolution large images: confidence collapses (measured 0.654 on a 1760×2464 photo, below the 0.85 threshold, plus one spurious face) and it rose to 0.924 once the long side was capped at `DETECT_MAX_SIDE` (1080). Keep the resize + coordinate scale-back in `_detect_yunet`.
 - `segmenter.py` sets `NUMBA_THREADING_LAYER=workqueue` before importing rembg to avoid the TBB interface warning; keep it.
 - `render_crop` must keep `np.rint` before `uint8` and premultiplied alpha; truncation causes dark halos and breaks compositing tests.
 - Never reintroduce `cv2.imshow` / `cv2.waitKey`; the Tk event loop owns input and display. Frames remain BGR arrays rendered by `_build_*_frame`, then shown through `_show_canvas` (RGB → PIL → `PhotoImage.paste`).
@@ -98,7 +100,7 @@ Fixed specs: one-inch 295×413, two-inch 413×579, both 300 DPI. Crop math: heig
 - `_busy` blocks reentrant keys and drops while YuNet/rembg run synchronously. `_processing_frame` flushes with `update_idletasks`, not `update`, so a scheduled `_tick` cannot overwrite the progress frame.
 - Dropping a file while the camera is live must release the camera first; keep that behavior.
 - Still mode redraws only when `_dirty` is set. Do not force continuous redraws; idle CPU is ~0.7%. Camera preview is heavier because every frame is resized, converted, and pasted into a Tk `PhotoImage`.
-- Auto detector falls back to Haar only when the YuNet file is missing; a missing U²-Net model is a hard `RuntimeError`.
+- Auto detector falls back to Haar only when the YuNet file is missing; a missing segmentation model raises `FileNotFoundError`.
 - Models run locally; no image leaves the machine during processing.
 - Known limits: one face per image, segmentation artifacts on busy backgrounds or fine hair, output sizes are common standards rather than a legal guarantee, and drag-and-drop relies on X11/Xdnd (Wayland uses XWayland).
 
