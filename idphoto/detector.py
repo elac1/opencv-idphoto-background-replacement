@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .config import YUNET_MODEL_PATH
+from .config import DETECT_MAX_SIDE, YUNET_MODEL_PATH
 
 
 class FaceNotFoundError(RuntimeError):
@@ -78,28 +78,46 @@ class FaceDetector:
         width: int,
         height: int,
     ) -> list[Face]:
+        # 大图先缩到长边 DETECT_MAX_SIDE：YuNet 在超大输入上置信度会明显下降，
+        # 检测完再把坐标按比例放大回原图坐标系。
+        scale = min(1.0, DETECT_MAX_SIDE / max(width, height))
+        if scale < 1.0:
+            detect_width = max(1, int(round(width * scale)))
+            detect_height = max(1, int(round(height * scale)))
+            detect_image = cv2.resize(
+                image_bgr,
+                (detect_width, detect_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            detect_image = image_bgr
+            detect_width, detect_height = width, height
+
         if self._yunet is None:
             self._yunet = cv2.FaceDetectorYN.create(
                 str(self.model_path),
                 "",
-                (width, height),
+                (detect_width, detect_height),
                 self.score_threshold,
                 0.3,
                 5000,
             )
         else:
-            self._yunet.setInputSize((width, height))
+            self._yunet.setInputSize((detect_width, detect_height))
 
-        _, raw_faces = self._yunet.detect(image_bgr)
+        _, raw_faces = self._yunet.detect(detect_image)
         if raw_faces is None:
             return []
 
+        # 缩放导致的坐标误差，用原图/检测图的比例还原。
+        back = 1.0 / scale
         faces: list[Face] = []
         for row in raw_faces:
             score = float(row[14])
             if score < self.score_threshold:
                 continue
-            x, y, face_width, face_height = (float(value) for value in row[:4])
+            x, y, face_width, face_height = (float(value) * back for value in row[:4])
+            landmarks = row[4:14].reshape(5, 2).astype(np.float32) * back
             faces.append(
                 Face(
                     x=x,
@@ -107,7 +125,7 @@ class FaceDetector:
                     width=face_width,
                     height=face_height,
                     score=score,
-                    landmarks=row[4:14].reshape(5, 2).astype(np.float32),
+                    landmarks=landmarks,
                 )
             )
         return faces
