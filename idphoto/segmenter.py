@@ -14,6 +14,7 @@ from .config import (
     ALPHA_MATTING_FOREGROUND_THRESHOLD,
     ALPHA_REFINE_RADIUS,
     BACKGROUND_SOLID_TOLERANCE,
+    COLOR_LINE_RADIUS,
     DECONTAMINATE_FLOOR,
     EDGE_TRIM_PX,
     FILL_MASK_HOLES,
@@ -142,6 +143,81 @@ def estimate_background_field(
     return field if residual <= tolerance else None
 
 
+def _extend_colour(source: np.ndarray, known: np.ndarray, sigma: float) -> np.ndarray:
+    """
+    用 known 区域内像素的**加权邻域均值**外推出整幅画面的颜色。
+
+    必须是单边的：前景色只能由轮廓内侧的发丝推出来，背景色只能由外侧推出来。
+    用 inpaint 时若待填充环的另一侧就是另一种颜色，填充值会被拉过去，alpha 就解不准。
+    归一化卷积既天然单边，又能把高光/噪点平均掉，不会像最近邻取值那样出现亮斑。
+    """
+    weights = known.astype(np.float32)
+    support = cv2.GaussianBlur(weights, (0, 0), sigma)
+    colour = cv2.GaussianBlur(source.astype(np.float32) * weights[:, :, None], (0, 0), sigma)
+    filled = colour / np.maximum(support, 1e-4)[:, :, None]
+    # 离 known 太远的地方没有可信外推值，退回原图像素
+    weak = support < 1e-3
+    filled[weak] = source.astype(np.float32)[weak]
+    return filled
+
+
+def color_line_alpha(
+    image_rgb: np.ndarray,
+    alpha: np.ndarray,
+    radius: int = COLOR_LINE_RADIUS,
+    background: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    在轮廓带内用**颜色线模型**重新解算 alpha。
+
+    模型的 alpha 是低分辨率上采样来的，在柔软、虚焦的发丝边缘经常给得偏高：
+    那片像素的颜色其实就是原背景色（浅灰白），却被打成不透明前景。这种像素靠
+    decontaminate 救不回来 —— 减掉背景再除以 a，得到的仍是灰白，贴到蓝底上就是
+    一圈白光。真正错的是 a 本身。
+
+    对轮廓两侧 radius 像素的带内像素，用合成方程 C = a·F + (1-a)·B 反解：
+        a = (C - B)·(F - B) / ‖F - B‖²
+    F 取轮廓内侧（确定前景）外推出的颜色，B 取轮廓外侧（远处背景）外推出的颜色。
+    发丝让 a 落在 0~1 之间，纯背景自然得 a≈0，纯头发得 a≈1。
+
+    前背景色过于接近（例如白衬衫配白底）时投影没有意义，保留原 alpha。
+
+    background 可以传入 estimate_background_field 已经算好的背景场，省掉一次
+    背景外推；不传则从轮廓外侧自行 inpaint 估计。
+    """
+    if radius <= 0:
+        return alpha
+
+    binary = (alpha > 0.5).astype(np.uint8)
+    if not binary.any():
+        return alpha
+
+    kernel = np.ones((radius * 2 + 1, radius * 2 + 1), np.uint8)
+    inner = cv2.erode(binary, kernel)
+    outer = cv2.dilate(binary, kernel)
+    band = (outer > 0) & (inner == 0)
+    if not band.any():
+        return alpha
+
+    source = np.ascontiguousarray(image_rgb, dtype=np.uint8)
+    # F 只由轮廓内侧外推、B 只由外侧外推；sigma 与带宽同量级，保持局部性。
+    foreground = _extend_colour(source, (inner > 0), float(max(2, radius)))
+    if background is None:
+        background = _extend_colour(source, (outer == 0), float(max(2, radius)))
+    background = np.asarray(background, np.float32)
+
+    direction = foreground - background
+    denom = (direction ** 2).sum(axis=2)
+    projection = ((source.astype(np.float32) - background) * direction).sum(axis=2)
+    projection = np.clip(projection / np.maximum(denom, 1e-3), 0.0, 1.0)
+
+    # 前背景色差太小的时候投影会退化成噪声，这些像素沿用模型给的 alpha。
+    reliable = denom > 40.0 ** 2
+    result = np.where(inner > 0, 1.0, 0.0).astype(np.float32)
+    result[band] = np.where(reliable[band], projection[band], alpha[band])
+    return result
+
+
 def decontaminate(
     image_rgb: np.ndarray,
     alpha: np.ndarray,
@@ -200,6 +276,7 @@ class PortraitSegmenter:
         decontaminate_background: bool = True,
         fill_mask_holes: bool = FILL_MASK_HOLES,
         edge_trim_px: int = EDGE_TRIM_PX,
+        color_line_radius: int = COLOR_LINE_RADIUS,
     ) -> None:
         self.model_name = model_name
         self.model_dir = Path(model_dir) if model_dir else U2NET_MODEL_DIR
@@ -208,6 +285,7 @@ class PortraitSegmenter:
         self.decontaminate_background = decontaminate_background
         self.fill_holes = fill_mask_holes
         self.edge_trim_px = edge_trim_px
+        self.color_line_radius = color_line_radius
         self._session = None
 
     def _load_session(self):
@@ -251,7 +329,7 @@ class PortraitSegmenter:
         return self.postprocess(rgb, rgba)
 
     def postprocess(self, image_rgb: np.ndarray, rgba: np.ndarray) -> np.ndarray:
-        """对模型原样输出做打磨：补洞 -> 细化 alpha -> 去背景色污染。"""
+        """对模型原样输出做打磨：补洞 -> 细化 alpha -> 颜色线重解 -> 去背景色污染。"""
         alpha = rgba[:, :, 3].astype(np.float32) / 255.0
 
         if self.fill_holes:
@@ -265,9 +343,13 @@ class PortraitSegmenter:
         alpha = refine_alpha(alpha, image_rgb, self.refine_radius)
 
         foreground = image_rgb
+        background = None
         if self.decontaminate_background:
             background = estimate_background_field(image_rgb, alpha)
+            # 只有背景足够平滑（背景场可信）时才敢用颜色线重解 alpha，
+            # 否则 F/B 都估不准，投影会把边缘改坏。
             if background is not None:
+                alpha = color_line_alpha(image_rgb, alpha, self.color_line_radius, background)
                 foreground = decontaminate(image_rgb, alpha, background)
 
         alpha = trim_alpha(alpha, self.edge_trim_px)

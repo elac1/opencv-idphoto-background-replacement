@@ -7,6 +7,7 @@ import numpy as np
 
 from idphoto.segmenter import (
     PortraitSegmenter,
+    color_line_alpha,
     decontaminate,
     estimate_background_field,
     fill_holes,
@@ -134,6 +135,63 @@ class RefineAlphaTest(unittest.TestCase):
         self.assertLessEqual(float(refined.max()), 1.0)
 
 
+class ColorLineAlphaTest(unittest.TestCase):
+    """轮廓带内按合成方程反解 alpha：模型把柔软发丝判成不透明时靠它救回来。"""
+
+    FOREGROUND = np.array([28.0, 28.0, 30.0], np.float32)
+    BACKGROUND = np.array([238.0, 238.0, 238.0], np.float32)
+
+    @classmethod
+    def make_scene(cls, inflation: int = 8):
+        """白底上的深色圆盘，模型 alpha 比真实轮廓外扩 inflation 像素（经典白边成因）。"""
+        size = 120
+        true_alpha = np.zeros((size, size), np.float32)
+        cv2.circle(true_alpha, (60, 60), 30, 1.0, -1)
+        true_alpha = cv2.GaussianBlur(true_alpha, (0, 0), 2.0)
+
+        model_alpha = np.zeros((size, size), np.float32)
+        cv2.circle(model_alpha, (60, 60), 30 + inflation, 1.0, -1)
+        model_alpha = cv2.GaussianBlur(model_alpha, (0, 0), 3.0)
+
+        composited = (true_alpha[:, :, None] * cls.FOREGROUND
+                      + (1 - true_alpha[:, :, None]) * cls.BACKGROUND)
+        return composited.astype(np.uint8), model_alpha, true_alpha
+
+    def test_zero_radius_is_identity(self) -> None:
+        alpha = np.zeros((20, 20), np.float32)
+        alpha[5:15, 5:15] = 1.0
+        rgb = np.full((20, 20, 3), 200, np.uint8)
+        self.assertTrue(np.array_equal(color_line_alpha(rgb, alpha, 0), alpha))
+
+    def test_pulls_inflated_edge_back_to_real_silhouette(self) -> None:
+        rgb, model_alpha, true_alpha = self.make_scene(inflation=8)
+        # 外扩环带：模型说是不透明前景，真值其实是透的
+        ring = (model_alpha > 0.5) & (true_alpha < 0.2)
+        self.assertGreater(int(ring.sum()), 0, "构造的场景本身应当有外扩环带")
+
+        fixed = color_line_alpha(rgb, model_alpha, radius=10)
+        self.assertLess(float(fixed[ring].mean()), 0.5, "外扩环带的 alpha 应当被压下来")
+        # 画面中心（真·前景）必须仍然不透明
+        self.assertGreater(float(fixed[60, 60]), 0.95)
+
+    def test_output_stays_in_unit_range(self) -> None:
+        rgb, model_alpha, _ = self.make_scene()
+        fixed = color_line_alpha(rgb, model_alpha, radius=8)
+        self.assertGreaterEqual(float(fixed.min()), 0.0)
+        self.assertLessEqual(float(fixed.max()), 1.0)
+
+    def test_keeps_model_alpha_when_foreground_matches_background(self) -> None:
+        """白衬衫配白底时前背景色无法区分，投影会退化，此时应保留模型原值。"""
+        rgb = np.full((80, 80, 3), 236, np.uint8)
+        alpha = np.zeros((80, 80), np.float32)
+        cv2.circle(alpha, (40, 40), 24, 1.0, -1)
+        fixed = color_line_alpha(rgb, alpha, radius=6)
+        # 轮廓带上不应被压成 0（与纯背景同色时不能凭空判定为透明）
+        band = (cv2.dilate((alpha > 0.5).astype(np.uint8), np.ones((13, 13), np.uint8)) > 0) \
+            & (alpha > 0.5)
+        self.assertGreater(float(fixed[band].min()), 0.4)
+
+
 class TrimAlphaTest(unittest.TestCase):
     def test_zero_pixels_is_identity(self) -> None:
         alpha = np.ones((10, 10), np.float32)
@@ -207,8 +265,8 @@ class PostprocessTest(unittest.TestCase):
         因此发白（约 133）。去污染应当把它还原回接近真值前景色（约 28）。
 
         注意：这里用 inflation=0（模型轮廓没有外扩）。若模型轮廓比真实轮廓胖一圈，
-        那些像素的 alpha 被高估成≈1，去污染无从下手 —— 那是"轮廓不准"的问题，
-        要靠更好的 alpha（alpha matting）解决，而不是颜色反解。
+        那些像素的 alpha 被高估成≈1，单靠去污染无从下手 —— 那一层由
+        color_line_alpha 按颜色线模型单独反解（见 ColorLineAlphaTest）。
         """
         rgb, rgba, true_alpha, _ = self.make_scene(inflation=0)
         band = (true_alpha > 0.25) & (true_alpha < 0.75)
